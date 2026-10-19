@@ -1,40 +1,109 @@
-import { Prisma } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 
 import { prisma } from '../db.js';
 import { requireAdminSignature } from '../middleware/adminAuth.js';
+import { notify } from '../notifications/service.js';
 
+/**
+ * Submission body: `ownerAddress` must be a Stellar G... public key;
+ * `name` and `description` are required (1–200 and 1–5000 characters);
+ * `contactEmail` is a required email; optional `website` is normalized to
+ * HTTPS when scheme-less and must be a URL; optional `country` is at most
+ * 100 characters.
+ */
 const applicationSchema = z.object({
   ownerAddress: z.string().regex(/^G[A-Z2-7]{55}$/),
   name: z.string().min(1).max(200),
   description: z.string().min(1).max(5000),
-  website: z.string().url().optional(),
+  // Normalize scheme-less domains (e.g. "example.org") to "https://example.org"
+  // before URL validation so applicants who omit the scheme aren't blocked.
+  website: z
+    .string()
+    .transform((val) => (val && !/^https?:\/\//i.test(val) ? `https://${val}` : val))
+    .pipe(z.string().url())
+    .optional(),
   contactEmail: z.string().email(),
   country: z.string().max(100).optional(),
 });
 
+/**
+ * Query for the admin list: optional status (`PENDING`, `APPROVED`, or
+ * `REJECTED`), `limit` from 1–100 (default 100), and non-negative `offset`
+ * (default 0).
+ */
 const listQuerySchema = z.object({
   status: z.enum(['PENDING', 'APPROVED', 'REJECTED']).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(100),
   offset: z.coerce.number().int().min(0).default(0),
 });
 
+/** Params for application detail and review routes; `id` must be an application UUID. */
 const idParamSchema = z.object({ id: z.string().uuid() });
 
+/** Query for the public status lookup; `ownerAddress` must be a Stellar G... public key. */
 const statusQuerySchema = z.object({
   // Stellar StrKey ed25519 public key: 'G' + 55 base32 (A-Z2-7) chars.
   // Same regex as GET /ngos/lookup.
-  ownerAddress: z
-    .string()
-    .regex(/^G[A-Z2-7]{55}$/),
+  ownerAddress: z.string().regex(/^G[A-Z2-7]{55}$/),
 });
 
+/** Review body for approve/reject; optional `reviewNote` is at most 2000 characters. */
 const reviewBodySchema = z.object({
   reviewNote: z.string().max(2000).optional(),
 });
 
+/**
+ * Inserts a PENDING application, or reports the application that already
+ * blocks this address.
+ *
+ * Read-then-write is a race on its own: two POSTs that arrive together both
+ * read "nothing blocking", both insert, and one address ends up with two
+ * PENDING applications. The obvious remedy — a partial unique index on
+ * (owner_address) WHERE status = 'PENDING' — is not available here. This
+ * project syncs its schema with `prisma db push` and has no migration files
+ * (see DEPLOYMENT.md), so a raw index would never be applied, and Prisma's
+ * schema language cannot express a partial index anyway.
+ *
+ * So the insert is serialised in the database instead: a transaction-scoped
+ * advisory lock keyed on the owner address. The second request blocks until
+ * the first transaction commits, then re-reads inside its own transaction and
+ * sees the row the winner inserted, taking the 409 path. Postgres releases
+ * the lock at COMMIT or ROLLBACK, so a crashed request cannot wedge the
+ * address, and a `hashtext` collision only serialises two unrelated addresses
+ * — it can never let a duplicate through.
+ */
+async function createApplicationUnlessBlocked(data: z.infer<typeof applicationSchema>) {
+  return prisma.$transaction(async (tx) => {
+    // `::text` pins the bind parameter's type instead of leaving it to the
+    // server to infer.
+    // $executeRaw, not $queryRaw: pg_advisory_xact_lock returns `void`, which
+    // the pg driver adapter cannot deserialize into a JS value. $executeRaw
+    // only needs the row count, so it sidesteps the unsupported column type.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${data.ownerAddress}::text)::bigint)`;
+
+    const existingApp = await tx.ngoApplication.findFirst({
+      where: {
+        ownerAddress: data.ownerAddress,
+        status: { in: ['PENDING', 'APPROVED'] },
+      },
+    });
+    if (existingApp) {
+      return { ok: false as const, status: existingApp.status };
+    }
+
+    return { ok: true as const, application: await tx.ngoApplication.create({ data }) };
+  });
+}
+
 export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> {
+  /**
+   * Submits a public NGO verification application.
+   * @route POST /v1/ngo-applications
+   * @body applicationSchema
+   * @auth Public
+   * @returns 201 created application; 400 `{ error: "invalid_request", details }`; 409 `{ error: "already_approved" | "application_already_pending" }`.
+   */
   app.post(
     '/ngo-applications',
     // Public write endpoint — tighter than the global default since it's
@@ -50,26 +119,24 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
     async (request, reply) => {
       const parsed = applicationSchema.safeParse(request.body);
       if (!parsed.success) {
-        return reply
-          .code(400)
-          .send({ error: 'invalid_request', details: parsed.error.flatten() });
+        return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
       }
 
-      const existingApp = await prisma.ngoApplication.findFirst({
-        where: {
-          ownerAddress: parsed.data.ownerAddress,
-          status: { in: ['PENDING', 'APPROVED'] },
-        },
-      });
-      if (existingApp) {
-        if (existingApp.status === 'APPROVED') {
+      const result = await createApplicationUnlessBlocked(parsed.data);
+      if (!result.ok) {
+        if (result.status === 'APPROVED') {
           return reply.code(409).send({ error: 'already_approved' });
         }
         return reply.code(409).send({ error: 'application_already_pending' });
       }
 
-      const application = await prisma.ngoApplication.create({ data: parsed.data });
-      return reply.code(201).send(application);
+      await notify({
+        type: 'application_submitted',
+        applicationId: result.application.id,
+        ownerAddress: result.application.ownerAddress,
+        name: result.application.name,
+      });
+      return reply.code(201).send(result.application);
     },
   );
 
@@ -78,24 +145,88 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
   // outcome and timestamps — never the contact details or description
   // submitted with the application, since anyone who knows (or guesses) an
   // address could otherwise read them.
-  app.get('/ngo-applications/status', async (request, reply) => {
-    const parsed = statusQuerySchema.safeParse(request.query);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
-    }
+  /**
+   * Returns the latest application status without exposing submitted details.
+   * @route GET /v1/ngo-applications/status
+   * @query ownerAddress Stellar public key
+   * @auth Public
+   * @returns 200 `{ status, createdAt, updatedAt }`; 400 invalid address; 404 `{ error: "not_found" }`.
+   */
+  app.get(
+    '/ngo-applications/status',
+    {
+      schema: {
+        tags: ['NGOs'],
+        summary: 'Check an NGO application status',
+        description: 'Returns only the status and timestamps for the supplied owner address.',
+        querystring: {
+          type: 'object',
+          properties: { ownerAddress: { type: 'string', pattern: '^G[A-Z2-7]{55}$' } },
+          required: ['ownerAddress'],
+        },
+        response: {
+          200: { type: 'object', additionalProperties: true },
+          400: { type: 'object', additionalProperties: true },
+          404: { type: 'object', additionalProperties: true },
+          503: { type: 'object', additionalProperties: true },
+        },
+      },
+    },
+    async (request, reply) => {
+      const parsed = statusQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
+      }
 
-    const application = await prisma.ngoApplication.findFirst({
-      where: { ownerAddress: parsed.data.ownerAddress },
-      orderBy: { createdAt: 'desc' },
-      select: { status: true, createdAt: true, updatedAt: true },
+      const application = await prisma.ngoApplication.findFirst({
+        where: { ownerAddress: parsed.data.ownerAddress },
+        orderBy: { createdAt: 'desc' },
+        select: { status: true, createdAt: true, updatedAt: true },
+      });
+      if (!application) {
+        return reply.code(404).send({ error: 'not_found' });
+      }
+
+      return application;
+    },
+  );
+
+  // Admin dashboard endpoint: returns application counts grouped by
+  // status so the client doesn't have to fetch and count applications
+  // itself. Must be registered before the /:id route so 'stats' isn't
+  // swallowed as an id and rejected by the UUID param validation.
+  /**
+   * Counts applications grouped by review status.
+   * @route GET /v1/ngo-applications/stats
+   * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
+   * @returns 200 `{ counts: { PENDING, APPROVED, REJECTED }, total }`.
+   */
+  app.get('/ngo-applications/stats', { preHandler: requireAdminSignature }, async () => {
+    const grouped = await prisma.ngoApplication.groupBy({
+      by: ['status'],
+      _count: { _all: true },
     });
-    if (!application) {
-      return reply.code(404).send({ error: 'not_found' });
+
+    const counts = { PENDING: 0, APPROVED: 0, REJECTED: 0 } as Record<string, number>;
+    for (const row of grouped) {
+      counts[row.status] = row._count._all;
     }
 
-    return application;
+    const total = counts.PENDING + counts.APPROVED + counts.REJECTED;
+
+    return {
+      counts: { PENDING: counts.PENDING, APPROVED: counts.APPROVED, REJECTED: counts.REJECTED },
+      total,
+    };
   });
 
+  /**
+   * Lists applications newest first with optional status and offset pagination.
+   * @route GET /v1/ngo-applications
+   * @query status, limit, offset
+   * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
+   * @returns 200 `{ applications: Application[], total, limit, offset }`; 400 `{ error: "invalid_request", details }`.
+   */
   app.get('/ngo-applications', { preHandler: requireAdminSignature }, async (request, reply) => {
     const parsed = listQuerySchema.safeParse(request.query);
     if (!parsed.success) {
@@ -117,6 +248,13 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
     return { applications, total, limit: parsed.data.limit, offset: parsed.data.offset };
   });
 
+  /**
+   * Returns a single application, including its submitted and review details.
+   * @route GET /v1/ngo-applications/:id
+   * @param id Application UUID
+   * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
+   * @returns 200 application; 400 invalid UUID; 404 `{ error: "not_found" }`.
+   */
   app.get(
     '/ngo-applications/:id',
     { preHandler: requireAdminSignature },
@@ -137,6 +275,14 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
     },
   );
 
+  /**
+   * Approves a pending application and optionally records a review note.
+   * @route POST /v1/ngo-applications/:id/approve
+   * @param id Application UUID
+   * @body Optional `{ reviewNote?: string }` (maximum 2000 characters)
+   * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
+   * @returns 200 updated application; 400 invalid params/body; 404 `{ error: "not_found" }`; 409 `{ error: "already_reviewed" }`.
+   */
   app.post(
     '/ngo-applications/:id/approve',
     { preHandler: requireAdminSignature },
@@ -152,28 +298,48 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
         return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
       }
 
-      try {
-        return await prisma.ngoApplication.update({
-          where: { id },
-          data: { status: 'APPROVED', reviewNote: parsed.data.reviewNote },
-        });
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
-          return reply.code(404).send({ error: 'not_found' });
-        }
-        throw err;
+      const application = await prisma.ngoApplication.findUnique({ where: { id } });
+      if (!application) {
+        return reply.code(404).send({ error: 'not_found' });
       }
       if (application.status !== 'PENDING') {
         return reply.code(409).send({ error: 'already_reviewed' });
       }
 
-      return await prisma.ngoApplication.update({
-        where: { id },
-        data: { status: 'APPROVED', reviewNote: parsed.data.reviewNote },
-      });
+      try {
+        const reviewed = await prisma.ngoApplication.update({
+          where: { id, status: 'PENDING' },
+          data: { status: 'APPROVED', reviewNote: parsed.data?.reviewNote },
+        });
+        await notify({
+          type: 'application_reviewed',
+          applicationId: reviewed.id,
+          ownerAddress: reviewed.ownerAddress,
+          status: 'APPROVED',
+          ...(reviewed.reviewNote ? { reviewNote: reviewed.reviewNote } : {}),
+        });
+        return reviewed;
+      } catch (err) {
+        if (
+          typeof err === 'object' &&
+          err !== null &&
+          (err as { code?: string }).code === 'P2025'
+        ) {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+        throw err;
+      }
     },
   );
 
+  /**
+   * Rejects a pending application and optionally records a review note.
+   * @route POST /v1/ngo-applications/:id/reject
+   * @param id Application UUID
+   * @body Optional `{ reviewNote?: string }` (maximum 2000 characters)
+   * @auth Admin signature required via `x-admin-address`, `x-admin-timestamp`, and `x-admin-signature`.
+   * @returns 200 updated application; 400 invalid params/body; 404 `{ error: "not_found" }`; 409 `{ error: "already_reviewed" }`.
+   */
   app.post(
     '/ngo-applications/:id/reject',
     { preHandler: requireAdminSignature },
@@ -189,25 +355,37 @@ export async function ngoApplicationRoutes(app: FastifyInstance): Promise<void> 
         return reply.code(400).send({ error: 'invalid_request', details: parsed.error.flatten() });
       }
 
-      try {
-        return await prisma.ngoApplication.update({
-          where: { id },
-          data: { status: 'REJECTED', reviewNote: parsed.data.reviewNote },
-        });
-      } catch (err) {
-        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
-          return reply.code(404).send({ error: 'not_found' });
-        }
-        throw err;
+      const application = await prisma.ngoApplication.findUnique({ where: { id } });
+      if (!application) {
+        return reply.code(404).send({ error: 'not_found' });
       }
       if (application.status !== 'PENDING') {
         return reply.code(409).send({ error: 'already_reviewed' });
       }
 
-      return await prisma.ngoApplication.update({
-        where: { id },
-        data: { status: 'REJECTED', reviewNote: parsed.data.reviewNote },
-      });
+      try {
+        const reviewed = await prisma.ngoApplication.update({
+          where: { id, status: 'PENDING' },
+          data: { status: 'REJECTED', reviewNote: parsed.data?.reviewNote },
+        });
+        await notify({
+          type: 'application_reviewed',
+          applicationId: reviewed.id,
+          ownerAddress: reviewed.ownerAddress,
+          status: 'REJECTED',
+          ...(reviewed.reviewNote ? { reviewNote: reviewed.reviewNote } : {}),
+        });
+        return reviewed;
+      } catch (err) {
+        if (
+          typeof err === 'object' &&
+          err !== null &&
+          (err as { code?: string }).code === 'P2025'
+        ) {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+        throw err;
+      }
     },
   );
 }

@@ -10,8 +10,31 @@ import { buildServer } from './server.js';
 const port = Number(process.env.PORT ?? 3000);
 const app = buildServer();
 
+// Left unwrapped so a handler failure propagates: worker.ts's own catch
+// logs it and, crucially, leaves the checkpoint unadvanced so the failed
+// event gets retried on the next poll instead of silently skipped.
+const stopIndexer = startIndexer(dispatchEvent);
+
+/**
+ * Tear down the indexer and HTTP server, then resolve. The caller is
+ * responsible for deciding the exit code and calling process.exit().
+ * Separating teardown from exit makes the function testable without
+ * process.exit side-effects.
+ */
+export async function shutdown(signal: string): Promise<void> {
+  app.log.info({ signal }, 'shutting down');
+  await stopIndexer();
+  await app.close();
+}
+
+// An unhandled promise rejection leaves the process in an unknown state just
+// like an uncaught synchronous exception — tear everything down cleanly and
+// let the orchestrator (Docker / Kubernetes / Render) restart the process.
 process.on('unhandledRejection', (reason) => {
-  app.log.error({ err: reason }, 'unhandled rejection');
+  app.log.error({ err: reason }, 'unhandled rejection — shutting down');
+  shutdown('unhandledRejection')
+    .catch((err) => app.log.error({ err }, 'error during shutdown'))
+    .finally(() => process.exit(1));
 });
 
 process.on('uncaughtException', (err) => {
@@ -24,25 +47,67 @@ app.listen({ port, host: '0.0.0.0' }).catch((err) => {
   process.exit(1);
 });
 
-// Left unwrapped so a handler failure propagates: worker.ts's own catch
-// logs it and, crucially, leaves the checkpoint unadvanced so the failed
-// event gets retried on the next poll instead of silently skipped.
-const stopIndexer = startIndexer(dispatchEvent);
-
-async function shutdown(signal: NodeJS.Signals): Promise<void> {
-  app.log.info({ signal }, 'shutting down');
-  stopIndexer();
-  try {
-    await app.close();
-    process.exit(0);
-  } catch (err) {
-    app.log.error({ err }, 'error during shutdown');
-    process.exit(1);
-  }
-}
 
 // SIGTERM is what Docker/Kubernetes send on `docker stop`/pod termination;
 // SIGINT is Ctrl+C locally. Without this, both just kill the process
 // mid-request instead of finishing in-flight work and closing the DB pool.
-process.on('SIGTERM', () => void shutdown('SIGTERM'));
-process.on('SIGINT', () => void shutdown('SIGINT'));
+process.on('SIGTERM', () => {
+  shutdown('SIGTERM')
+    .then(() => process.exit(0))
+    .catch((err) => {
+      app.log.error({ err }, 'error during shutdown');
+      process.exit(1);
+    });
+});
+
+process.on('SIGINT', () => {
+  shutdown('SIGINT')
+    .then(() => process.exit(0))
+    .catch((err) => {
+      app.log.error({ err }, 'error during shutdown');
+      process.exit(1);
+    });
+});
+const gracefulShutdown = async (signal: string) => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`\nReceived ${signal}. Starting graceful shutdown...`);
+
+    // Safety timeout to prevent hanging indefinitely (e.g., 10 seconds)
+    const timeout = setTimeout(() => {
+      console.error('Shutdown timed out, forcing exit.');
+      process.exit(1);
+    }, 10000);
+
+    try {
+      // 1. Await indexer stop (finishes in-flight poll)
+      if (indexerService && typeof indexerService.stopIndexer === 'function') {
+        console.log('Stopping indexer...');
+        await indexerService.stopIndexer();
+      }
+
+      // 2. Close NestJS application / HTTP server
+      console.log('Closing HTTP server...');
+      await app.close();
+
+      // 3. Disconnect Prisma
+      if (prismaService && typeof prismaService.$disconnect === 'function') {
+        console.log('Disconnecting database (Prisma)...');
+        await prismaService.$disconnect();
+      }
+
+      clearTimeout(timeout);
+      console.log('Graceful shutdown completed successfully.');
+      process.exit(0);
+    } catch (error) {
+      console.error('Error during graceful shutdown:', error);
+      clearTimeout(timeout);
+      process.exit(1);
+    }
+  };
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+}
+
+bootstrap();
